@@ -1,0 +1,257 @@
+use htmd::HtmlToMarkdown;
+use htmlize::unescape;
+use proxy_wasm::traits::*;
+use proxy_wasm::types::*;
+use std::str;
+
+proxy_wasm::main! {{
+    proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> { Box::new(HttpBodyRoot) });
+}}
+
+struct HttpBodyRoot;
+
+impl Context for HttpBodyRoot {}
+
+impl RootContext for HttpBodyRoot {
+    fn get_type(&self) -> Option<ContextType> {
+        Some(ContextType::HttpContext)
+    }
+
+    fn create_http_context(&self, _: u32) -> Option<Box<dyn HttpContext>> {
+        Some(Box::new(HttpBody))
+    }
+}
+
+// on_http_request_headers runs in nginx; the response hooks run in core-proxy.
+// Properties and context state do not cross that boundary — a request header is
+// the only channel. In nginx, set_http_request_header on a header that is absent
+// is a no-op, so the Convert flag is upserted: replace a client-sent value, else
+// add it. Core-proxy converts only on an exact "markdown" (live-tested 2026-10-28).
+struct HttpBody;
+impl Context for HttpBody {}
+
+impl HttpBody {
+    fn get_path(&self) -> String {
+        match self.get_property(vec!["request.path"]) {
+            Some(p) => {
+                // Paths are not guaranteed to be valid UTF-8; decode lossily for logging.
+                std::string::String::from_utf8_lossy(&p).into_owned()
+            }
+            None => "/".to_string(),
+        }
+    }
+}
+
+const SERVER_ERROR: u32 = 500;
+const CONVERT_FLAG: &str = "Convert";
+const CONVERT_VALUE: &str = "markdown";
+const CONTENT_TYPE_HEADER: &str = "Content-Type";
+const ACCEPT_HEADER: &str = "Accept";
+const ACCEPT_ENCODING_HEADER: &str = "Accept-Encoding";
+const CONTENT_LENGTH_HEADER: &str = "Content-Length";
+const TRANSFER_ENCODING_HEADER: &str = "Transfer-Encoding";
+const TRANSFER_ENCODING_CHUNKED: &str = "Chunked";
+const MARKDOWN_MIME_REQ: &str = "text/markdown";
+const MARKDOWN_MIME_RES: &str = "text/markdown; charset=utf-8";
+const HTML_MIME: &str = "text/html";
+
+impl HttpContext for HttpBody {
+    fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
+        let accept = self.get_http_request_header(ACCEPT_HEADER).unwrap_or_default();
+        let md = content_type_match(&accept, MARKDOWN_MIME_REQ);
+        // Always write the flag so a client-sent Convert can never survive.
+        let value = if md { CONVERT_VALUE } else { "none" };
+        if self.get_http_request_header(CONVERT_FLAG).is_some_and(|v| !v.is_empty()) {
+            self.set_http_request_header(CONVERT_FLAG, Some(value));
+        } else {
+            self.add_http_request_header(CONVERT_FLAG, value);
+        }
+        if md {
+            self.set_http_request_header(ACCEPT_ENCODING_HEADER, None); // prevent response compression
+        }
+        Action::Continue
+    }
+
+    fn on_http_response_headers(&mut self, _: usize, _: bool) -> Action {
+        // use Convert for cache key; merge with any existing Vary header
+        // missing Convert is a distinct value so it won't cause cache misses for requests that don't accept markdown
+        if let Some(vary) = self.get_http_response_header("Vary") {
+            // "*" must stand alone per RFC 9110; leave it untouched
+            let is_wildcard = vary.trim() == "*";
+            let has_convert = vary
+                .split(',')
+                .any(|v| v.trim().eq_ignore_ascii_case(CONVERT_FLAG));
+            if !is_wildcard && !has_convert {
+                let new_vary = if vary.is_empty() {
+                    CONVERT_FLAG.to_string()
+                } else {
+                    format!("{}, {}", CONVERT_FLAG, vary)
+                };
+                self.set_http_response_header("Vary", Some(&new_vary));
+            }
+        } else {
+            self.add_http_response_header("Vary", CONVERT_FLAG);
+        }
+
+        if self.get_http_request_header(CONVERT_FLAG).as_deref() != Some(CONVERT_VALUE) {
+            return Action::Continue;
+        }
+
+        if let Some(content_type) = self.get_http_response_header(CONTENT_TYPE_HEADER) {
+            if content_type_match(&content_type, HTML_MIME) {
+                println!("Got HTML to convert: {}", self.get_path());
+
+                self.remove_http_response_header(CONTENT_LENGTH_HEADER);
+                self.set_http_response_header(CONTENT_TYPE_HEADER, Some(MARKDOWN_MIME_RES));
+                self.set_http_response_header(
+                    TRANSFER_ENCODING_HEADER,
+                    Some(TRANSFER_ENCODING_CHUNKED),
+                );
+                self.set_property(vec!["response.md"], Some(b"true"));
+            }
+        }
+
+        Action::Continue
+    }
+
+    fn on_http_response_body(&mut self, body_size: usize, end_of_stream: bool) -> Action {
+        // process only when on_http_response_headers has set the convert flag,
+        // otherwise just deliver the body to user
+        if self.get_property(vec!["response.md"]).is_none() {
+            return Action::Continue;
+        }
+
+        // buffer the entire body before converting to markdown, since the conversion library doesn't support streaming
+        if !end_of_stream {
+            return Action::Pause;
+        }
+
+        if let Some(body_bytes) = self.get_http_response_body(0, body_size) {
+            let body_str = match str::from_utf8(&body_bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!(
+                        "cannot convert body to string {} for {}",
+                        e,
+                        self.get_path()
+                    );
+                    self.send_http_response(
+                        SERVER_ERROR,
+                        vec![],
+                        Some(b"Origin response is not valid UTF-8"),
+                    );
+                    return Action::Pause;
+                }
+            };
+            let converter = HtmlToMarkdown::builder()
+                .skip_tags(vec!["script", "style", "svg", "noscript", "iframe", "link"])
+                .build();
+            let md = match converter.convert(body_str) {
+                Ok(md) => md,
+                Err(e) => {
+                    println!(
+                        "cannot convert HTML to Markdown: {} for {}",
+                        e,
+                        self.get_path()
+                    );
+                    self.send_http_response(
+                        SERVER_ERROR,
+                        vec![],
+                        Some(b"Failed to convert HTML to Markdown"),
+                    );
+                    return Action::Pause;
+                }
+            };
+            // extra unescape for double-escaped HTML entities
+            let md = unescape(md);
+            self.set_http_response_body(0, body_size, md.as_bytes());
+        } else {
+            println!("empty body in {}", self.get_path());
+        }
+
+        Action::Continue
+    }
+}
+
+// Checks if the header value contains the expected content type, with optional utf-8 charset,
+// and (for Accept-style values) q != 0.
+fn content_type_match(header_value: &str, expected: &str) -> bool {
+    let expected = expected.to_ascii_lowercase();
+
+    // Accept header can be a comma-separated list
+    for item in header_value.split(',') {
+        let mut parts = item.split(';');
+        let mime = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        if mime != expected {
+            continue;
+        }
+
+        // Only allow missing charset or explicit utf-8 charset.
+        // If q=0 is provided, the media type is explicitly not acceptable.
+        let mut charset: Option<String> = None;
+        let mut q_zero = false;
+        for param in parts {
+            let mut kv = param.splitn(2, '=');
+            let key = kv.next().unwrap_or("").trim().to_ascii_lowercase();
+            let value = kv
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"')
+                .to_ascii_lowercase();
+
+            if key == "charset" {
+                charset = Some(value);
+            } else if key == "q" {
+                q_zero = value.parse::<f32>().is_ok_and(|weight| weight == 0.0);
+            }
+        }
+
+        if !q_zero && charset.as_deref().is_none_or(|value| value == "utf-8") {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_markdown_in_accept_list() {
+        assert!(content_type_match("text/markdown", MARKDOWN_MIME_REQ));
+        assert!(content_type_match("text/html, text/markdown;q=0.9", MARKDOWN_MIME_REQ));
+        assert!(content_type_match("TEXT/Markdown", MARKDOWN_MIME_REQ));
+    }
+
+    #[test]
+    fn rejects_q_zero_and_other_types() {
+        assert!(!content_type_match("text/markdown;q=0", MARKDOWN_MIME_REQ));
+        assert!(!content_type_match("text/markdown; q=0.0", MARKDOWN_MIME_REQ));
+        assert!(!content_type_match("text/plain, */*", MARKDOWN_MIME_REQ));
+        assert!(!content_type_match("", MARKDOWN_MIME_REQ));
+    }
+
+    #[test]
+    fn html_charset_must_be_utf8_when_present() {
+        assert!(content_type_match("text/html", HTML_MIME));
+        assert!(content_type_match("text/html; charset=UTF-8", HTML_MIME));
+        assert!(content_type_match("text/html; charset=\"utf-8\"", HTML_MIME));
+        assert!(!content_type_match("text/html; charset=iso-8859-1", HTML_MIME));
+    }
+
+    #[test]
+    fn conversion_drops_script_and_style() {
+        let converter = HtmlToMarkdown::builder()
+            .skip_tags(vec!["script", "style", "svg", "noscript", "iframe", "link"])
+            .build();
+        let md = converter
+            .convert("<h1>Title</h1><script>alert(1)</script><style>p{}</style><p>Body</p>")
+            .unwrap();
+        assert!(md.contains("# Title"));
+        assert!(md.contains("Body"));
+        assert!(!md.contains("alert"));
+        assert!(!md.contains("p{}"));
+    }
+}
