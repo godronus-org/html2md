@@ -1,6 +1,7 @@
-# Deploy this filter as your own FastEdge app.
+# Deploy this as your own FastEdge app.
 # 1. Add a repository secret GCORE_API_KEY (your Gcore API token).
-# 2. Actions → Deploy → Run workflow.
+# 2. Review the app name and env below.
+# 3. Actions → Deploy → Run workflow.
 # Runs only when started by hand; add a push trigger to deploy on every change.
 name: Deploy
 
@@ -22,7 +23,7 @@ jobs:
       - uses: gcore-github-actions/fastedge/deploy-app@v1
         with:
           api_key: ${{ secrets.GCORE_API_KEY }}
-          wasm_file: target/wasm32-wasip1/release/html2md.wasm
-          app_name: html2md
-          comment: HTML to Markdown CDN filter
+          wasm_file: "target/wasm32-wasip1/release/html2md.wasm"
+          app_name: "html2md"
+          comment: "Transform origin's HTML responses to Markdown format when request header \"Accept\" is equal to \"text/markdown\". Particularly useful for AI Agents."
           env: "{}"

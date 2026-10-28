@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.5 (2026-10-28)
+
+
+### Miscellaneous Chores
+
+* note that the mirror's workflows are generated
+
 ## 0.1.4 (2026-10-28)
 
 
